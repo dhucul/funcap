@@ -40,10 +40,10 @@ So we got one fat script file atm.
 
 # IDA imports
 
-from __future__ import absolute_import
-from __future__ import print_function
 #import sys
 import pickle
+import os
+import re
 from idaapi import *
 from idautils import *
 from ida_kernwin import *
@@ -52,10 +52,34 @@ from idc import *
 from ida_bytes import *
 from ida_funcs import *
 from ida_dbg import *
+import ida_auto
+import ida_idp
+import ida_frame
+import ida_graph
+import ida_idaapi
+import ida_kernwin
+import ida_ida
 import ida_idd
-from six.moves import range
+import ida_lines
+import ida_name
 
 # utility functions
+
+def _byte_value(x):
+    '''
+    Normalize a byte-like value across Python 2/3 and IDA memory APIs.
+    Accepts either an int or a 1-byte bytes/str element.
+    '''
+    if isinstance(x, int):
+        return x
+    if isinstance(x, bytes):
+        return x[0] if x else 0
+    if isinstance(x, str):
+        return ord(x[0]) if x else 0
+    try:
+        return int(x)
+    except Exception:
+        return 0
 
 def format_name(ea):
     name = get_func_name(ea)
@@ -69,28 +93,63 @@ def format_offset(ea):
         offset = "0x%x" % ea
     return offset
 
+def debugger_ready():
+    '''
+    Return True when IDA has a selected debugger and a live register context.
+    '''
+    try:
+        regs = dbg_get_registers()
+        return bool(regs)
+    except Exception:
+        return False
+
+
 def get_arch():
     '''
     Get the target architecture.
+
+    Prefer static IDB information so FunCap can be started before the debuggee
+    has run. Fall back to live debugger registers when needed.
     Supported archs: x86 32-bit, x86 64-bit, ARM 32-bit
     '''
-    (arch, bits) = (None, None)
-    for x in dbg_get_registers():
-        name = x[0]
-        if name == 'RAX':
-            arch = 'amd64'
-            bits = 64
-            break
-        elif name == 'EAX':
-            arch = 'x86'
-            bits = 32
-            break
-        elif name == 'R0':
-            arch = 'arm'
-            bits = 32
-            break
+    # Static database-based detection works even before the debugger runs.
+    try:
+        procname = ida_idp.get_idp_name()
+    except Exception:
+        procname = None
 
-    return (arch, bits)
+    try:
+        if not procname:
+            procname = ida_ida.inf_get_procname()
+    except Exception:
+        pass
+
+    if procname:
+        pname = str(procname).lower()
+        if pname in ("metapc", "pc", "8086"):
+            if ida_ida.inf_is_64bit():
+                return ("amd64", 64)
+            return ("x86", 32)
+        if "arm" in pname:
+            # This script only supports 32-bit ARM in its ARM hook.
+            return ("arm", 32)
+
+    # Live-register fallback for unusual targets/backends.
+    regs = dbg_get_registers()
+    if regs:
+        for x in regs:
+            if not x:
+                continue
+            name = x[0]
+            if name == 'RAX':
+                return ('amd64', 64)
+            elif name == 'EAX':
+                return ('x86', 32)
+            elif name == 'R0':
+                return ('arm', 32)
+
+    raise RuntimeError("Unable to determine target architecture from the IDB or debugger context.")
+
 
 class FunCapHook(DBG_Hooks):
     '''
@@ -149,11 +208,11 @@ class FunCapHook(DBG_Hooks):
         self.colors = kwargs.get('colors', True)
         self.output_console = kwargs.get('output_console', True)
         self.overwrite_existing = kwargs.get('overwrite_existing', False)
-        self.recursive = kwargs.get('recursive', False)
+        self.recursive = kwargs.get('recursive', True)
         self.code_discovery = kwargs.get('code_discovery', False) # for obfuscators
         self.code_discovery_nojmp = kwargs.get('code_discovery_nojmp', False)
         self.code_discovery_stop = kwargs.get('code_discovery_stop', False)
-        self.no_dll = kwargs.get('no_dll', False)
+        self.no_dll = kwargs.get('no_dll', True)
         self.strings_file = kwargs.get('strings', os.path.expanduser('~') + "/funcap_strings.txt")
         self.multiple_dereferences = kwargs.get('multiple_dereferences', 3)
 
@@ -178,10 +237,25 @@ class FunCapHook(DBG_Hooks):
     # I started to implement GUI as well but it did not work as expected so it won't be implemented...
     ###
 
+    def reset_runtime_state(self, clear_capture_cache=False):
+        '''
+        Reset transient debugger/hook state so capture can restart cleanly without
+        restarting the whole plugin.
+        '''
+        self.stub_steps = 0
+        self.stub_name = None
+        self.current_caller = None
+        self.delayed_caller = None
+
+        if clear_capture_cache:
+            self.saved_contexts = {}
+            self.function_calls = {}
+
     def on(self):
         '''
         Turn the script on
         '''
+        self.reset_runtime_state(clear_capture_cache=True)
         if self.outfile:
             self.out = open(self.outfile, 'w')
         if self.strings_file:
@@ -193,10 +267,13 @@ class FunCapHook(DBG_Hooks):
         '''
         Turn the script off
         '''
+        self.reset_runtime_state(clear_capture_cache=True)
         if self.out != None:
             self.out.close()
+            self.out = None
         if self.strings_out != None:
             self.strings_out.close()
+            self.strings_out = None
         self.unhook()
 
         print("FunCap is OFF")
@@ -311,10 +388,12 @@ class FunCapHook(DBG_Hooks):
         CallGraph("FunCap: function calls", self.calls_graph, exact_offsets).Show()
 
     def saveGraph(self, path = os.path.expanduser('~') + "/funcap.graph"):
-        pickle.dump(d.calls_graph, open(path, "w"))
+        with open(path, "wb") as fp:
+            pickle.dump(d.calls_graph, fp)
 
     def loadGraph(self, path = os.path.expanduser('~') + "/funcap.graph"):
-        d.calls_graph = pickle.load(open(path, "r"))
+        with open(path, "rb") as fp:
+            d.calls_graph = pickle.load(fp)
 
     def addStop(self, ea):
         '''
@@ -371,9 +450,23 @@ class FunCapHook(DBG_Hooks):
         @param addr: address belonging to a function
 
         '''
+        frame_id = get_func_attr(addr, FUNCATTR_FRAME)
+        frame_size = get_frame_size(addr)
+        arg_size = get_func_attr(addr, FUNCATTR_ARGSIZE)
 
-        argFrameSize = get_struc_size(get_func_attr(addr, FUNCATTR_FRAME)) - get_frame_size(addr) + get_func_attr(addr, FUNCATTR_ARGSIZE)
-        return argFrameSize / (self.bits/8)
+        # IDA may not have frame metadata for some functions yet.
+        if frame_id is None or frame_id == BADADDR or frame_size is None or arg_size is None:
+            return 0
+
+        struct_size = get_struc_size(frame_id)
+        if struct_size is None or struct_size < 0:
+            return 0
+
+        arg_frame_size = struct_size - frame_size + arg_size
+        if arg_frame_size <= 0:
+            return 0
+
+        return int(arg_frame_size // (self.bits // 8))
 
     def get_caller(self):
 
@@ -395,6 +488,47 @@ class FunCapHook(DBG_Hooks):
             if reg['name'] == name:
                 return reg['value']
 
+    def normalize_dbg_ea(self, ea, ref_ea=None):
+        '''
+        Normalize debugger/runtime addresses so they can be compared to IDA database EAs.
+
+        Some IDA/debugger combinations on x64 appear to report runtime IP/return addresses
+        with only the low 32 bits populated, while breakpoint EAs in the IDB keep the full
+        64-bit image base. When that happens, rebuild the high 32 bits from a nearby
+        reference EA from the IDB.
+        '''
+        if ea is None:
+            return ea
+        try:
+            ea = int(ea)
+        except Exception:
+            return ea
+
+        if self.bits == 64 and ea >= 0 and ea <= 0xFFFFFFFF and ref_ea not in (None, BADADDR):
+            try:
+                ref_ea = int(ref_ea)
+                high = ref_ea & 0xFFFFFFFF00000000
+                if high:
+                    return high | (ea & 0xFFFFFFFF)
+            except Exception:
+                pass
+        return ea
+
+    def ea_match(self, a, b):
+        '''
+        Compare EAs robustly across debugger backends that may return truncated x64 addresses.
+        '''
+        if a is None or b is None:
+            return False
+        try:
+            if int(a) == int(b):
+                return True
+            if self.bits == 64 and (int(a) & 0xFFFFFFFF) == (int(b) & 0xFFFFFFFF):
+                return True
+        except Exception:
+            return False
+        return False
+
     def add_comments(self, ea, lines, every = False):
         '''
         Insert lines (posterior and anterior lines which are referred to as "comments" in this code) into IDA assembly listing
@@ -406,14 +540,14 @@ class FunCapHook(DBG_Hooks):
         '''
 
         idx = 0
+        ida_lines.delete_extra_cmts(ea, E_PREV)
         for line in lines:
-            # workaround with Eval() - ExtLinA() doesn't work well in idapython
-            line_sanitized = line.replace('"', '\\"')
-            ret = eval_idc('ExtLinA(%d, %d, "%s");' % (ea, idx, line_sanitized))
-            if ret:
-                self.output("idc.eval_idc() returned an error: %s" % ret)
+            ok = ida_lines.update_extra_cmt(ea, E_PREV + idx, line)
+            if not ok:
+                self.output("ida_lines.update_extra_cmt() failed at 0x%x" % ea)
             idx += 1
-            if every == False and idx > self.CMT_MAX: break
+            if every == False and idx > self.CMT_MAX:
+                break
 
     def format_normal(self, regs):
         '''
@@ -768,10 +902,10 @@ class FunCapHook(DBG_Hooks):
 
         for char in data:
             # if we've hit a non printable char, break
-            if char < 32 or char > 126:
+            if _byte_value(char) < 32 or _byte_value(char) > 126:
                 break
 
-            discovered += chr(char)
+            discovered += chr(_byte_value(char))
 
         if len(discovered) < self.STRING_EXPLORATION_MIN_LENGTH:
             return False
@@ -794,8 +928,8 @@ class FunCapHook(DBG_Hooks):
         discovered = ""
 
         for char in data:
-            if char >= 32 and char <= 126:
-                discovered += chr(char)
+            if _byte_value(char) >= 32 and _byte_value(char) <= 126:
+                discovered += chr(_byte_value(char))
             elif print_dots:
                 discovered += "."
 
@@ -820,10 +954,10 @@ class FunCapHook(DBG_Hooks):
         for char in data:
             if every_other:
                 # if we've hit a non printable char, break
-                if char < 32 or char > 126:
+                if _byte_value(char) < 32 or _byte_value(char) > 126:
                     break
 
-                discovered += chr(char)
+                discovered += chr(_byte_value(char))
 
             every_other = not every_other
 
@@ -846,10 +980,10 @@ class FunCapHook(DBG_Hooks):
         dump = ""
 
         for byte in data:
-            dump  += "%02x " % ord(byte)
+            dump  += "%02x " % _byte_value(byte)
 
         for byte in data:
-            if byte >= 32 and byte <= 126:
+            if _byte_value(byte) >= 32 and _byte_value(byte) <= 126:
                 dump += chr(byte)
             else:
                 dump += "."
@@ -940,14 +1074,14 @@ class FunCapHook(DBG_Hooks):
         '''
         Return next instruction to ea
         '''
-        end = get_inf_structure().get_maxEA()
+        end = ida_ida.inf_get_max_ea()
         return next_head(ea, end)
 
     def prev_ins(self, ea):
         '''
         Return previous instruction to ea
         '''
-        start = get_inf_structure().get_minEA()
+        start = ida_ida.inf_get_min_ea()
         return idc.prev_head(ea, start)
 
     # handlers called from within debug hooks
@@ -960,7 +1094,7 @@ class FunCapHook(DBG_Hooks):
         function_name = get_func_name(ea)
         caller = self.format_caller(self.get_caller())
         if function_name:
-            header = "At function end: %s (0x%x) " % (function_name,ea) + "to " + caller
+            header = "At function end: {} (0x{:x}) ".format(function_name,ea) + "to " + caller
             raw_context = self.get_context(ea=ea)
         else:
             header = "At function end - unknown function (0x%x) " % ea + "to " + caller
@@ -996,10 +1130,10 @@ class FunCapHook(DBG_Hooks):
             del self.saved_contexts[sp]
         else:
             func_name = function_call['func_name']
-            self.output("WARNING: saved context not found for stack pointer 0x%x, assuming function %s" % (sp, function_call['func_name']))
+            self.output("WARNING: saved context not found for stack pointer 0x{:x}, assuming function {}".format(sp, function_call['func_name']))
             saved_context = None
 
-        header = "Returning from call to %s(), execution resumed at %s (0x%x)" % (func_name, format_offset(ea), ea)
+        header = "Returning from call to {}(), execution resumed at {} (0x{:x})".format(func_name, format_offset(ea), ea)
         (context_full, context_comments) = self.format_return(raw_context, saved_context)
 
         if self.comments and (self.overwrite_existing or ea not in self.visited):
@@ -1018,7 +1152,7 @@ class FunCapHook(DBG_Hooks):
         caller_offset = self.format_caller(caller_ea)
         caller_name = format_name(caller_ea)
 
-        header = "At function start: %s (0x%x) " % (name,ea) + "called by %s" % caller_offset
+        header = "At function start: {} (0x{:x}) ".format(name,ea) + "called by %s" % caller_offset
 
         raw_context= self.get_context(ea=ea)
         if self.colors:
@@ -1091,11 +1225,12 @@ class FunCapHook(DBG_Hooks):
         Called when single stepping into a jmp instruction
         '''
 
+        ea = self.normalize_dbg_ea(ea, self.current_caller['addr'] if self.current_caller else None)
         if self.comments:
             set_cmt(self.current_caller['addr'], "0x%x" % ea, False)
         seg_name = get_segm_name(ea)
         if self.code_discovery and (not is_code(get_full_flags(ea)) or not self.isCode) and not self.is_system_lib(seg_name):
-            self.output("New code segment discovered: %s (0x%x => 0x%x)" % (seg_name, self.current_caller['addr'], ea))
+            self.output("New code segment discovered: {} (0x{:x} => 0x{:x})".format(seg_name, self.current_caller['addr'], ea))
             start_ea = get_segm_start(ea)
             end_ea = get_segm_end(ea)
             refresh_debugger_memory()
@@ -1164,7 +1299,7 @@ class FunCapHook(DBG_Hooks):
             start_ea = get_segm_start(ea)
             end_ea = get_segm_end(ea)
             refresh_debugger_memory()
-            self.output("0x%x: new code section detected: [0x%x, 0x%x]" % (ea, start_ea, end_ea))
+            self.output("0x{:x}: new code section detected: [0x{:x}, 0x{:x}]".format(ea, start_ea, end_ea))
             plan_and_wait(start_ea, end_ea)
             if self.code_discovery_stop:
                 self.resume = False
@@ -1186,11 +1321,11 @@ class FunCapHook(DBG_Hooks):
         Called when single stepping into a call instruction (lands at the beginning of a function)
         '''
 
-        ea = self.get_ip()
+        ea = self.normalize_dbg_ea(self.get_ip(), self.current_caller['addr'] if self.current_caller else None)
 
         if self.is_fake_call(ea):
             set_cmt(self.current_caller['addr'], "fake function call to 0x%x" % ea, False)
-            self.output("0x%X: fake function call to 0x%x" % (self.current_caller['addr'],ea))
+            self.output("0x{:X}: fake function call to 0x{:x}".format(self.current_caller['addr'],ea))
             self.current_caller = self.delayed_caller
             self.delayed_caller = None
             return 0
@@ -1218,6 +1353,8 @@ class FunCapHook(DBG_Hooks):
 
         if name:
             num_args = self.get_num_args_stack(ea)
+            if num_args == 0:
+                self.output("INFO: no stack argument frame available for 0x{:x}; continuing with register-only capture".format(ea))
             arguments = self.get_stack_args(ea=ea, depth=num_args+1)
             # if recursive or code_discover mode, hook the new functions with breakpoints on all calls (or jumps)
             if (self.recursive or self.code_discovery) and not self.is_system_lib(seg_name) and name not in self.hooked:
@@ -1226,7 +1363,7 @@ class FunCapHook(DBG_Hooks):
             name = get_name(ea, ida_name.GN_VISIBLE) # maybe there is a symbol (happens sometimes when the IDA analysis goes wrong)
             if not name: name = "0x%x" % ea
             # this probably is not a real function then - handle it in a generic way
-            self.output("Call to unknown function: 0x%x to %s" % (caller_ea,name))
+            self.output("Call to unknown function: 0x{:x} to {}".format(caller_ea,name))
             self.handle_generic(ea)
             self.current_caller = self.delayed_caller
             self.delayed_caller = None
@@ -1234,10 +1371,10 @@ class FunCapHook(DBG_Hooks):
 
         # if we were going through a stub, display the name that was called directly (e.g. not kernelbase but kernel32)
         if self.stub_name:
-            header = "Function call: %s to %s (0x%x)" % (caller, stub_name, ea) +\
+            header = "Function call: {} to {} (0x{:x})".format(caller, stub_name, ea) +\
                     "\nReal function called: %s" % name
         else:
-            header = "Function call: %s to %s (0x%x)" % (caller, name, ea)
+            header = "Function call: {} to {} (0x{:x})".format(caller, name, ea)
 
         # link previously captured register context with stack-based arguments
 
@@ -1381,6 +1518,31 @@ class FunCapHook(DBG_Hooks):
 
         return 0
 
+    def dbg_process_start(self, pid, tid, ea, name, base, size):
+        self.reset_runtime_state(clear_capture_cache=True)
+        return 0
+
+    def dbg_process_attach(self, pid, tid, ea, name, base, size):
+        self.reset_runtime_state(clear_capture_cache=True)
+        return 0
+
+    def dbg_process_exit(self, pid, tid, ea, code):
+        self.reset_runtime_state(clear_capture_cache=True)
+        return 0
+
+    def dbg_process_detach(self, pid, tid, ea):
+        self.reset_runtime_state(clear_capture_cache=True)
+        return 0
+
+    def dbg_run_to(self, pid, tid=0, ea=BADADDR):
+        self.reset_runtime_state(clear_capture_cache=False)
+        return 0
+
+    def dbg_exception(self, pid, tid, ea, exc_code, can_continue, exc_ea, exc_info):
+        # Exceptions can interrupt step/call pairing and leave stale caller state behind.
+        self.reset_runtime_state(clear_capture_cache=False)
+        return 0
+
     def dbg_step_into(self):
         '''
         Standard callback routine for stepping into.
@@ -1413,15 +1575,16 @@ class FunCapHook(DBG_Hooks):
             self.handle_after_jump(ea)
         else:
             # type must be call
-            ret_addr = self.return_address()
+            ref_ea = self.current_caller['addr'] if (hasattr(self, 'current_caller') and self.current_caller) else None
+            ret_addr = self.normalize_dbg_ea(self.return_address(), ref_ea)
+            expected_next = self.next_ins(self.current_caller['addr']) if (hasattr(self, 'current_caller') and self.current_caller) else BADADDR
 
-            if hasattr(self, 'current_caller') and self.current_caller and ret_addr == self.next_ins(self.current_caller['addr']):
+            if hasattr(self, 'current_caller') and self.current_caller and self.ea_match(ret_addr, expected_next):
                 self.handle_after_call(ret_addr, self.stub_name)
                 self.stub_name = None
             else:
                 # that's not us - return to IDA
-                self.current_caller = None
-                self.delayed_caller = None
+                self.reset_runtime_state(clear_capture_cache=False)
                 if self.resume: "FunCap: unexpected single step" # happens sometimes - due to a BUG in IDA. Hope one day it will be corrected
         if self.resume:
             request_continue_process()
@@ -1455,7 +1618,7 @@ class X86CapHook(FunCapHook):
         Check if we are at jump to subrouting instruction
         '''
         mnem = generate_disasm_line(ea,0)
-        if re.match('call\s+far ptr', mnem): return None # when IDA badly identifies data as code it throws false positives - zbot example
+        if re.match(r'call\s+far ptr', mnem): return None # when IDA badly identifies data as code it throws false positives - zbot example
         return re.match('call', mnem)
 
     def is_jump(self, ea):
@@ -1475,7 +1638,7 @@ class X86CapHook(FunCapHook):
         @param depth: stack depth to capture - if None then number of it is determined automatically based on number of arguments in the function frame
         '''
         regs = []
-        for x in dbg_get_registers():
+        for x in (dbg_get_registers() or []):
             name = x[0]
             if not general_only or (re.match("E", name) and name != 'ES'):
                 value = idc.get_reg_value(name)
@@ -1490,7 +1653,10 @@ class X86CapHook(FunCapHook):
         '''
         l = []
         stack = idc.get_reg_value('ESP')
-        if depth == None: depth = self.get_num_args_stack(ea)+1
+        if depth == None:
+            depth = self.get_num_args_stack(ea) + 1
+        if depth is None:
+            depth = 1
         depth = int(depth)
         argno = 0
         for arg in range(stack_offset, depth):
@@ -1572,7 +1738,7 @@ class X86CapHook(FunCapHook):
         # kernel32.dll:76401489 5D                            pop     ebp
         # kernel32.dll:7640148A E9 2D FF FF FF                jmp     sub_764013BC
         dbytes = ida_idd.dbg_read_memory(ea, 7)
-        if dbytes == "\x8b\xff\x55\x8b\xec\x5d\xe9" or dbytes == "\x8b\xff\x55\x8b\xec\x5d\xeb":
+        if _bytes_eq(dbytes, b"\x8b\xff\x55\x8b\xec\x5d\xe9") or _bytes_eq(dbytes, b"\x8b\xff\x55\x8b\xec\x5d\xeb"):
             return 5
         # no stubs. You can define your custom stubs here
         return 0
@@ -1630,7 +1796,7 @@ class AMD64CapHook(FunCapHook):
         '''
         regs = []
 
-        for x in dbg_get_registers():
+        for x in (dbg_get_registers() or []):
             name = x[0]
             if not general_only or (re.match("R", name) and name != 'RS'):
                 value = idc.get_reg_value(name)
@@ -1646,7 +1812,10 @@ class AMD64CapHook(FunCapHook):
         '''
         l = []
         stack = idc.get_reg_value('RSP')
-        if depth == None: depth = self.get_num_args_stack(ea)+1
+        if depth == None:
+            depth = self.get_num_args_stack(ea) + 1
+        if depth is None:
+            depth = 1
         depth = int(depth) #why the fuck we get float here ?
         argno = 0
         for arg in range(stack_offset, depth):
@@ -1745,7 +1914,7 @@ class ARMCapHook(FunCapHook):
         Check if we are at return from subroutine instruction
         '''
         disasm = generate_disasm_line(ea,0)
-        return re.match('POP.*,PC\}', disasm) or re.match('BX(\s+)LR', disasm)
+        return re.match(r'POP.*,PC\}', disasm) or re.match(r'BX(\s+)LR', disasm)
 
     def is_call(self, ea):
         '''
@@ -1761,7 +1930,7 @@ class ARMCapHook(FunCapHook):
         '''
 
         mnem = print_insn_mnem(ea)
-        return re.match('B\s+', mnem)
+        return re.match(r'B\s+', mnem)
 
     def get_context(self, general_only=True, ea=None, depth=None):
         '''
@@ -1771,7 +1940,7 @@ class ARMCapHook(FunCapHook):
         '''
 
         l = []
-        for x in dbg_get_registers():
+        for x in (dbg_get_registers() or []):
             name = x[0]
             value = idc.get_reg_value(name)
             l.append({'name': name, 'value': value, 'deref': self.dereference(value, 2 * self.STRING_LENGTH)})
@@ -1815,7 +1984,7 @@ class ARMCapHook(FunCapHook):
 
 
 
-class CallGraph(GraphViewer):
+class CallGraph(ida_graph.GraphViewer):
     '''
     Class to draw real function call graphs based on stack capture (not like in IDA's trace)
     It will draw all sorts of indirects calls (CALL DWORD etc.)
@@ -1823,7 +1992,7 @@ class CallGraph(GraphViewer):
     '''
 
     def __init__(self, title, calls, exact_offsets):
-        GraphViewer.__init__(self, title, calls)
+        ida_graph.GraphViewer.__init__(self, title)
         self.calls = calls
         self.nodes = {}
         self.exact_offsets = exact_offsets
@@ -1849,7 +2018,7 @@ class CallGraph(GraphViewer):
                     graph_caller = caller['ea']
                 else:
                     graph_caller = get_func_attr(caller['ea'], FUNCATTR_START)
-                    if graph_caller == 0xffffffff: # no symbol exist
+                    if graph_caller == BADADDR: # no symbol exist
                         graph_caller = caller['ea']
                         caller_name = caller['name']
                     else:
@@ -1876,7 +2045,7 @@ class CallGraph(GraphViewer):
     def OnHint(self, node_id):
         ea, label = self[node_id]
         disasm = generate_disasm_line(ea-1,0)
-        return "0x%x %s" % (ea, disasm)
+        return "0x{:x} {}".format(ea, disasm)
 
 ###
 # automation scripts examples - works for win32 and win64-bit
@@ -1892,7 +2061,7 @@ class Auto:
         '''
         d.off()
         d.delAll()
-        start = get_entry_ordinal(0)
+        start = get_entry(get_entry_ordinal(0))
         add_bpt(start)
         segname = get_segm_name(start)
         start_process('', '', '')
@@ -1911,7 +2080,7 @@ class Auto:
         '''
         d.off()
         d.delAll()
-        start = get_entry_ordinal(0)
+        start = get_entry(get_entry_ordinal(0))
         add_bpt(start)
         start_process('', '', '')
         wait_for_next_event(WFNE_SUSP, -1);
@@ -1929,7 +2098,7 @@ class Auto:
         '''
         d.off()
         d.delAll()
-        start = get_entry_ordinal(0)
+        start = get_entry(get_entry_ordinal(0))
         add_bpt(start)
         start_process('', '', '')
         wait_for_next_event(WFNE_SUSP, -1);
@@ -1943,31 +2112,272 @@ class Auto:
         resume_process()
 
 ###
-# main()
+# plugin integration for IDA 9.x
 ###
 
-debugger = False
-
-try:
-    (arch, bits) = get_arch()
-    debugger = True
-except TypeError:
-    print("FunCap: please select a debugger first")
+PLUGIN_NAME = "FunCap"
+PLUGIN_PREFIX = "funcap:"
+MENU_ROOT = "Edit/Plugins/FunCap/"
 
 
-if debugger:
-    try:
-        d.off()
-    except: AttributeError
+class _FunCapState(object):
+    def __init__(self):
+        self.hook = None
+        self.bootstrap_hook = None
+        self.auto = None
+        self.handlers = []
+        self.action_names = []
+        self.pending_start = False
 
+
+_STATE = _FunCapState()
+
+
+class _BootstrapHook(DBG_Hooks):
+    def __init__(self):
+        super(_BootstrapHook, self).__init__()
+
+    def _activate_real_hook(self):
+        if not _STATE.pending_start:
+            return 0
+        if not debugger_ready():
+            return 0
+        try:
+            _STATE.hook = None
+            hook = _ensure_hook(turn_on=True, recreate=True)
+            _STATE.pending_start = False
+            ida_kernwin.msg("FunCap: capture is ON\n")
+            return 0
+        except Exception as exc:
+            ida_kernwin.warning("FunCap: deferred start failed: %s" % exc)
+            return 0
+
+    def dbg_suspend_process(self):
+        return self._activate_real_hook()
+
+    def dbg_process_start(self, pid, tid, ea, name, base, size):
+        return self._activate_real_hook()
+
+    def dbg_process_attach(self, pid, tid, ea, name, base, size):
+        return self._activate_real_hook()
+
+
+
+def _arm_deferred_start():
+    if _STATE.bootstrap_hook is None:
+        _STATE.bootstrap_hook = _BootstrapHook()
+        _STATE.bootstrap_hook.hook()
+    _STATE.pending_start = True
+    ida_kernwin.msg("FunCap: armed deferred start. Capture will turn on automatically when debugger context becomes available.\n")
+    return _STATE.bootstrap_hook
+
+
+def _create_default_hook():
+    arch, bits = get_arch()
     if arch == 'x86':
-        d = X86CapHook()
-    elif arch == 'amd64':
-        d = AMD64CapHook()
-    elif arch == 'arm' and bits == 32:
-        d = ARMCapHook()
-    else:
-        raise ValueError("FunCap: architecture not supported")
+        return X86CapHook()
+    if arch == 'amd64':
+        return AMD64CapHook()
+    if arch == 'arm' and bits == 32:
+        return ARMCapHook()
+    raise ValueError("FunCap: architecture not supported")
 
-    a = Auto()
-    d.on()
+
+def _ensure_hook(turn_on=True, recreate=False):
+    if recreate and _STATE.hook is not None:
+        try:
+            _STATE.hook.off()
+        except Exception:
+            try:
+                _STATE.hook.unhook()
+            except Exception:
+                pass
+        _STATE.hook = None
+
+    if _STATE.hook is not None:
+        if turn_on and getattr(_STATE.hook, 'out', None) is None and getattr(_STATE.hook, 'strings_out', None) is None:
+            _STATE.hook.on()
+        return _STATE.hook
+
+    hook = _create_default_hook()
+    _STATE.hook = hook
+    _STATE.auto = Auto()
+    globals()['d'] = hook
+    globals()['a'] = _STATE.auto
+    if turn_on:
+        hook.on()
+    return hook
+
+
+def _stop_hook():
+    hook = _STATE.hook
+    if hook is None:
+        _STATE.pending_start = False
+        return
+    try:
+        if hasattr(hook, 'off'):
+            hook.off()
+        else:
+            hook.unhook()
+    except Exception as exc:
+        ida_kernwin.warning("FunCap: failed to stop cleanly: %s" % exc)
+    finally:
+        _STATE.hook = None
+        _STATE.pending_start = False
+
+
+def _safe_invoke(label, fn):
+    try:
+        return fn()
+    except Exception as exc:
+        ida_kernwin.warning("%s failed: %s" % (label, exc))
+        return 0
+
+
+class _FunCapActionHandler(ida_kernwin.action_handler_t):
+    def __init__(self, callback, enabled_when_debugger=True):
+        super().__init__()
+        self.callback = callback
+        self.enabled_when_debugger = enabled_when_debugger
+
+    def activate(self, ctx):
+        return 1 if _safe_invoke(PLUGIN_NAME, self.callback) is not None else 0
+
+    def update(self, ctx):
+        if not self.enabled_when_debugger:
+            return ida_kernwin.AST_ENABLE_ALWAYS
+        try:
+            get_arch()
+            return ida_kernwin.AST_ENABLE_ALWAYS
+        except Exception:
+            return ida_kernwin.AST_DISABLE_ALWAYS
+
+
+def _register_action(name, label, callback, shortcut=None, tooltip=None, enabled_when_debugger=True):
+    full_name = PLUGIN_PREFIX + name
+    handler = _FunCapActionHandler(callback, enabled_when_debugger=enabled_when_debugger)
+    desc = ida_kernwin.action_desc_t(full_name, label, handler, shortcut, tooltip or label)
+    if not ida_kernwin.register_action(desc):
+        raise RuntimeError("unable to register action %s" % full_name)
+    if not ida_kernwin.attach_action_to_menu(MENU_ROOT + label, full_name, ida_kernwin.SETMENU_APP):
+        ida_kernwin.unregister_action(full_name)
+        raise RuntimeError("unable to attach action %s to menu" % full_name)
+    _STATE.handlers.append(handler)
+    _STATE.action_names.append(full_name)
+
+
+def _unregister_actions():
+    for action_name in list(reversed(_STATE.action_names)):
+        try:
+            ida_kernwin.detach_action_from_menu(MENU_ROOT, action_name)
+        except Exception:
+            pass
+        try:
+            ida_kernwin.unregister_action(action_name)
+        except Exception:
+            pass
+    _STATE.action_names = []
+    _STATE.handlers = []
+
+
+def _action_start():
+    hook = _ensure_hook(turn_on=True, recreate=True)
+    _STATE.pending_start = False
+    ida_kernwin.msg("FunCap: capture is ON\n")
+    return hook
+
+
+def _action_stop():
+    _stop_hook()
+    ida_kernwin.msg("FunCap: capture is OFF\n")
+    return 1
+
+
+def _action_hook_current_function():
+    hook = _ensure_hook(turn_on=True)
+    hook.hookFunc()
+    return 1
+
+
+def _action_hook_current_segment():
+    hook = _ensure_hook(turn_on=True)
+    hook.hookSeg()
+    return 1
+
+
+def _action_add_callee():
+    hook = _ensure_hook(turn_on=True)
+    hook.addCallee()
+    return 1
+
+
+def _action_clear_breakpoints():
+    hook = _ensure_hook(turn_on=False)
+    hook.delAll()
+    ida_kernwin.msg("FunCap: deleted all breakpoints\n")
+    return 1
+
+
+def _action_show_graph():
+    hook = _ensure_hook(turn_on=False)
+    hook.graph()
+    return 1
+
+
+def _action_win_call_capture():
+    hook = _ensure_hook(turn_on=False)
+    globals()['d'] = hook
+    globals()['a'] = Auto()
+    globals()['a'].win_call_capture()
+    return 1
+
+
+class FunCapPlugin(ida_idaapi.plugin_t):
+    flags = ida_idaapi.PLUGIN_KEEP
+    comment = "Capture runtime function call data during debugging"
+    help = "FunCap runtime capture plugin"
+    wanted_name = PLUGIN_NAME
+    wanted_hotkey = ""
+
+    def init(self):
+        try:
+            if _STATE.bootstrap_hook is None:
+                _STATE.bootstrap_hook = _BootstrapHook()
+                _STATE.bootstrap_hook.hook()
+            _register_action("start", "Start capture", _action_start, tooltip="Enable FunCap hooks and logging")
+            _register_action("stop", "Stop capture", _action_stop, tooltip="Disable FunCap hooks and logging", enabled_when_debugger=False)
+            _register_action("hook_func", "Hook current function", _action_hook_current_function, tooltip="Add breakpoints on call instructions in the current function")
+            _register_action("hook_seg", "Hook current segment", _action_hook_current_segment, tooltip="Add breakpoints on call instructions in the current segment")
+            _register_action("callee", "Hook function starts and returns", _action_add_callee, tooltip="Add breakpoints on all function starts and return instructions")
+            _register_action("clear_bpts", "Delete all breakpoints", _action_clear_breakpoints, tooltip="Delete all breakpoints managed in the session")
+            _register_action("graph", "Show call graph", _action_show_graph, tooltip="Display the captured runtime call graph", enabled_when_debugger=False)
+            _register_action("auto_win_call", "Run Windows call-capture automation", _action_win_call_capture, tooltip="Run the binary and capture call instructions automatically")
+            return ida_idaapi.PLUGIN_KEEP
+        except Exception as exc:
+            ida_kernwin.warning("FunCap init failed: %s" % exc)
+            _unregister_actions()
+            return ida_idaapi.PLUGIN_SKIP
+
+    def run(self, arg):
+        _action_start()
+
+    def term(self):
+        _stop_hook()
+        if _STATE.bootstrap_hook is not None:
+            try:
+                _STATE.bootstrap_hook.unhook()
+            except Exception:
+                pass
+            _STATE.bootstrap_hook = None
+        _unregister_actions()
+
+
+def PLUGIN_ENTRY():
+    return FunCapPlugin()
+
+
+if __name__ == '__main__':
+    try:
+        _action_start()
+    except Exception as exc:
+        print("FunCap: %s" % exc)
