@@ -81,6 +81,18 @@ def _byte_value(x):
     except Exception:
         return 0
 
+
+def _bytes_eq(data, pattern):
+    '''
+    Compare debugger-read bytes safely against a byte pattern.
+    '''
+    if data is None:
+        return False
+    try:
+        return bytes(data) == pattern
+    except Exception:
+        return data == pattern
+
 def format_name(ea):
     name = get_func_name(ea)
     if name == "" or name == None:
@@ -216,12 +228,14 @@ class FunCapHook(DBG_Hooks):
         self.strings_file = kwargs.get('strings', os.path.expanduser('~') + "/funcap_strings.txt")
         self.multiple_dereferences = kwargs.get('multiple_dereferences', 3)
 
-        self.visited = [] # functions visited already
+        self.visited = set() # functions/items visited already
         self.saved_contexts = {} # saved stack contexts - to re-dereference arguments when the function exits
         self.function_calls = {} # recorded function calls - used for several purposes
         self.stop_points = [] # brekpoints where FunCap will pause the process to let user start the analysis
         self.calls_graph = {} # graph nodes prepared for call graphs
-        self.hooked = [] # functions that were already hooked
+        self.hooked = set() # functions that were already hooked (by ea)
+        self.bp_added = set() # all EAs where FunCap inserted a breakpoint
+        self.callsite_cache = {} # func start ea -> list of call/jump instruction eas
         self.stub_steps = 0
         self.stub_name = None
         self.current_caller = None # for single step - before-call context
@@ -250,6 +264,10 @@ class FunCapHook(DBG_Hooks):
         if clear_capture_cache:
             self.saved_contexts = {}
             self.function_calls = {}
+            self.bp_added = set()
+            self.callsite_cache = {}
+            self.hooked = set()
+            self.visited = set()
 
     def on(self):
         '''
@@ -284,6 +302,7 @@ class FunCapHook(DBG_Hooks):
         '''
         for f in list(Functions()):
             add_bpt(f)
+            self.bp_added.add(f)
 
     def addFuncRet(self):
         '''
@@ -298,6 +317,7 @@ class FunCapHook(DBG_Hooks):
 
                     if self.is_ret(head):
                         add_bpt(head)
+                        self.bp_added.add(head)
 
     def addCallee(self):
         '''
@@ -329,7 +349,7 @@ class FunCapHook(DBG_Hooks):
                 self.add_call_and_jump_bp(start_ea, end_ea)
             else:
                 self.add_call_bp(start_ea, end_ea)
-        self.hooked.append(func)
+        self.hooked.add(ea)
 
     def hookSeg(self, seg = "", jump = False):
         '''
@@ -375,7 +395,9 @@ class FunCapHook(DBG_Hooks):
         '''
 
         for bp in range(get_bpt_qty(), 0, -1):
-            del_bpt(get_bpt_ea(bp))
+            bp_ea = get_bpt_ea(bp)
+            del_bpt(bp_ea)
+            self.bp_added.discard(bp_ea)
 
     def graph(self, exact_offsets = False):
         '''
@@ -404,6 +426,7 @@ class FunCapHook(DBG_Hooks):
 
         self.stop_points.append(ea)
         add_bpt(ea)
+        self.bp_added.add(ea)
 
     ###
     # END of public interface
@@ -1104,11 +1127,12 @@ class FunCapHook(DBG_Hooks):
         (context_full, context_comments) = self.format_normal(raw_context)
         if self.delete_breakpoints:
             del_bpt(ea)
+            self.bp_added.discard(ea)
 
         if self.comments and (self.overwrite_existing or ea not in self.visited):
             self.add_comments(ea, context_comments, every = True)
 
-        self.visited.append(ea)
+        self.visited.add(ea)
         self.output_lines([ header ] + context_full + [ "" ])
 
     def handle_return(self, ea):
@@ -1138,7 +1162,7 @@ class FunCapHook(DBG_Hooks):
 
         if self.comments and (self.overwrite_existing or ea not in self.visited):
             self.add_comments(ea, context_comments)
-        self.visited.append(ea)
+        self.visited.add(ea)
         self.output_lines([ header ] + context_full + [ "" ])
 
     def handle_function_start(self, ea):
@@ -1170,9 +1194,9 @@ class FunCapHook(DBG_Hooks):
         if self.comments and (self.overwrite_existing or ea not in self.visited):
             self.add_comments(ea, context_comments, every = True)
 
-        self.visited.append(ea)
+        self.visited.add(ea)
 
-        self.visited.append(ea)
+        self.visited.add(ea)
         self.output_lines([ header ] + context_full + [ "" ])
 
 
@@ -1191,7 +1215,7 @@ class FunCapHook(DBG_Hooks):
         if self.comments and (self.overwrite_existing or ea not in self.visited):
             self.add_comments(ea, context_comments)
 
-        self.visited.append(ea)
+        self.visited.add(ea)
         self.output_lines([ header ] + context_full + [ "" ])
 
     def handle_call(self, ea):
@@ -1357,7 +1381,7 @@ class FunCapHook(DBG_Hooks):
                 self.output("INFO: no stack argument frame available for 0x{:x}; continuing with register-only capture".format(ea))
             arguments = self.get_stack_args(ea=ea, depth=num_args+1)
             # if recursive or code_discover mode, hook the new functions with breakpoints on all calls (or jumps)
-            if (self.recursive or self.code_discovery) and not self.is_system_lib(seg_name) and name not in self.hooked:
+            if (self.recursive or self.code_discovery) and not self.is_system_lib(seg_name) and ea not in self.hooked:
                 self.hookFunc(func = name)
         else:
             name = get_name(ea, ida_name.GN_VISIBLE) # maybe there is a symbol (happens sometimes when the IDA analysis goes wrong)
@@ -1394,6 +1418,7 @@ class FunCapHook(DBG_Hooks):
         else:
             user_bp = False
             add_bpt(ret_addr) # catch return from the function if not user-added breakpoint
+            self.bp_added.add(ret_addr)
 
         # fetch the operand for "ret" - will be needed when we will capture the return from the function
         ret_shift = self.calc_ret_shift(ea)
@@ -1423,7 +1448,7 @@ class FunCapHook(DBG_Hooks):
             set_cmt(caller_ea, "%s()" % name, False)
 
         # next time we don't need to insert comments (unless overwrite_existing is set)
-        self.visited.append(caller_ea)
+        self.visited.add(caller_ea)
 
         if self.colors:
             set_color(ea, CIC_FUNC, self.FUNC_COLOR)
@@ -1475,6 +1500,7 @@ class FunCapHook(DBG_Hooks):
             self.handle_return(ea)
             if self.function_calls[ea]['user_bp'] == False:
                 del_bpt(ea)
+                self.bp_added.discard(ea)
                 if self.resume:
                     request_continue_process()
                     run_requests()
@@ -1494,6 +1520,7 @@ class FunCapHook(DBG_Hooks):
             # we don't want ResumeProcess() to be called so we end it up here
             if self.delete_breakpoints:
                 del_bpt(ea)
+                self.bp_added.discard(ea)
             return 0
 
         elif self.is_call(ea): # stopped on a call to a function
@@ -1504,6 +1531,7 @@ class FunCapHook(DBG_Hooks):
             run_requests()
             if self.delete_breakpoints:
                 del_bpt(ea)
+                self.bp_added.discard(ea)
             return 0
 
         else: # not call, not ret, and not start of any function
@@ -1512,6 +1540,7 @@ class FunCapHook(DBG_Hooks):
 
         if self.delete_breakpoints:
             del_bpt(ea)
+            self.bp_added.discard(ea)
         if self.resume:
             request_continue_process()
             run_requests()
