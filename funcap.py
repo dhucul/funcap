@@ -54,6 +54,7 @@ from ida_funcs import *
 from ida_dbg import *
 import ida_auto
 import ida_idp
+import ida_ua
 import ida_frame
 import ida_graph
 import ida_idaapi
@@ -308,16 +309,37 @@ class FunCapHook(DBG_Hooks):
         '''
         Add breakpoints on all return from subroutine instructions
         '''
-        for seg_ea in Segments():
-        # For each of the defined elements
-            for head in Heads(seg_ea, get_segm_end(seg_ea)):
-
-                # If it's an instruction
-                if is_code(get_full_flags(head)):
-
+        count = 0
+        total = 0
+        insn = ida_ua.insn_t()
+        bp_added = self.bp_added
+        show_wait = getattr(ida_kernwin, 'replace_wait_box', None)
+        ida_kernwin.show_wait_box("FunCap: scanning for return instructions...")
+        try:
+            for seg_ea in Segments():
+                cancelled = False
+                for head in Heads(seg_ea, get_segm_end(seg_ea)):
+                    total += 1
+                    if total & 0xFFF == 0:
+                        if ida_kernwin.user_cancelled():
+                            self.output("addFuncRet cancelled by user after %d breakpoints" % count)
+                            cancelled = True
+                            break
+                        if show_wait:
+                            show_wait("FunCap: %d ret breakpoints (%d insns scanned)..." % (count, total))
+                    if head in bp_added:
+                        continue
+                    if not is_code(get_full_flags(head)):
+                        continue
                     if self.is_ret(head):
                         add_bpt(head)
-                        self.bp_added.add(head)
+                        bp_added.add(head)
+                        count += 1
+                if cancelled:
+                    break
+        finally:
+            ida_kernwin.hide_wait_box()
+        self.output("addFuncRet: %d breakpoints set (%d instructions scanned)" % (count, total))
 
     def addCallee(self):
         '''
@@ -343,13 +365,26 @@ class FunCapHook(DBG_Hooks):
 
         self.output("hooking function: %s()" % func)
 
-        chunks = Chunks(ea)
-        for (start_ea, end_ea) in chunks:
-            if jump:
-                self.add_call_and_jump_bp(start_ea, end_ea)
-            else:
-                self.add_call_bp(start_ea, end_ea)
-        self.hooked.add(ea)
+        ida_kernwin.show_wait_box("FunCap: hooking %s..." % func)
+        cancelled = False
+        try:
+            chunks = list(Chunks(ea))
+            replace = getattr(ida_kernwin, 'replace_wait_box', None)
+            for i, (start_ea, end_ea) in enumerate(chunks):
+                if replace:
+                    replace("FunCap: hooking %s (chunk %d/%d)..." % (func, i + 1, len(chunks)))
+                if ida_kernwin.user_cancelled():
+                    self.output("hookFunc cancelled by user on %s" % func)
+                    cancelled = True
+                    break
+                if jump:
+                    self.add_call_and_jump_bp(start_ea, end_ea, _progress=False)
+                else:
+                    self.add_call_bp(start_ea, end_ea, _progress=False)
+        finally:
+            ida_kernwin.hide_wait_box()
+        if not cancelled:
+            self.hooked.add(ea)
 
     def hookSeg(self, seg = "", jump = False):
         '''
@@ -432,7 +467,7 @@ class FunCapHook(DBG_Hooks):
     # END of public interface
     ###
 
-    def add_call_bp(self, start_ea, end_ea):
+    def add_call_bp(self, start_ea, end_ea, _progress=True):
         '''
         Add breakpoints on every subrountine call instruction within the given scope (start_ea, end_ea)
 
@@ -440,15 +475,39 @@ class FunCapHook(DBG_Hooks):
         @param end_ea:
         '''
 
-        for head in Heads(start_ea, end_ea):
+        count = 0
+        total = 0
+        insn = ida_ua.insn_t()
+        bp_added = self.bp_added
+        show_wait = getattr(ida_kernwin, 'replace_wait_box', None)
+        if _progress:
+            ida_kernwin.show_wait_box("FunCap: scanning for call instructions...")
+        try:
+            for head in Heads(start_ea, end_ea):
+                total += 1
+                if total & 0xFFF == 0:  # update progress every ~4096 items
+                    if ida_kernwin.user_cancelled():
+                        self.output("cancelled by user after %d breakpoints" % count)
+                        break
+                    if show_wait:
+                        show_wait("FunCap: %d breakpoints set (%d insns scanned)..." % (count, total))
+                if head in bp_added:
+                    continue
+                if not is_code(get_full_flags(head)):
+                    continue
+                # Use decode_insn + CF_CALL feature flag - much faster than
+                # generate_disasm_line() or print_insn_mnem() + regex matching
+                if ida_ua.decode_insn(insn, head) > 0:
+                    if insn.get_canon_feature() & ida_idp.CF_CALL:
+                        add_bpt(head)
+                        bp_added.add(head)
+                        count += 1
+        finally:
+            if _progress:
+                ida_kernwin.hide_wait_box()
+        self.output("add_call_bp: %d breakpoints set (%d instructions scanned)" % (count, total))
 
-            # If it's an instruction
-            if is_code(get_full_flags(head)):
-
-                if self.is_call(head):
-                    add_bpt(head)
-
-    def add_call_and_jump_bp(self, start_ea, end_ea):
+    def add_call_and_jump_bp(self, start_ea, end_ea, _progress=True):
         '''
         Add breakpoints on every subrountine call instruction and jump instruction within the given scope (start_ea, end_ea)
 
@@ -457,13 +516,36 @@ class FunCapHook(DBG_Hooks):
 
         '''
 
-        for head in Heads(start_ea, end_ea):
-
-            # If it's an instruction
-            if is_code(get_full_flags(head)):
-
-                if (self.is_call(head) or self.is_jump(head)):
-                    add_bpt(head)
+        count = 0
+        total = 0
+        insn = ida_ua.insn_t()
+        bp_added = self.bp_added
+        show_wait = getattr(ida_kernwin, 'replace_wait_box', None)
+        if _progress:
+            ida_kernwin.show_wait_box("FunCap: scanning for call/jump instructions...")
+        try:
+            for head in Heads(start_ea, end_ea):
+                total += 1
+                if total & 0xFFF == 0:
+                    if ida_kernwin.user_cancelled():
+                        self.output("cancelled by user after %d breakpoints" % count)
+                        break
+                    if show_wait:
+                        show_wait("FunCap: %d breakpoints set (%d insns scanned)..." % (count, total))
+                if head in bp_added:
+                    continue
+                if not is_code(get_full_flags(head)):
+                    continue
+                if ida_ua.decode_insn(insn, head) > 0:
+                    feat = insn.get_canon_feature()
+                    if feat & (ida_idp.CF_CALL | ida_idp.CF_JUMP):
+                        add_bpt(head)
+                        bp_added.add(head)
+                        count += 1
+        finally:
+            if _progress:
+                ida_kernwin.hide_wait_box()
+        self.output("add_call_and_jump_bp: %d breakpoints set (%d instructions scanned)" % (count, total))
 
 
     def get_num_args_stack(self, addr):
@@ -1646,9 +1728,14 @@ class X86CapHook(FunCapHook):
         '''
         Check if we are at jump to subrouting instruction
         '''
-        mnem = generate_disasm_line(ea,0)
-        if re.match(r'call\s+far ptr', mnem): return None # when IDA badly identifies data as code it throws false positives - zbot example
-        return re.match('call', mnem)
+        mnem = print_insn_mnem(ea)
+        if not mnem or not mnem.startswith('call'):
+            return None
+        # filter out "call far ptr" false positives from misidentified data
+        disasm = generate_disasm_line(ea, 0)
+        if disasm and re.match(r'call\s+far ptr', disasm):
+            return None
+        return True
 
     def is_jump(self, ea):
         '''
